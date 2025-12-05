@@ -80,9 +80,9 @@ Examples of built-in modes include:
 * `editing`: Optimizes Serena for direct code modification tasks.
 * `interactive`: Suitable for a conversational, back-and-forth interaction style.
 * `one-shot`: Configures Serena for tasks that should be completed in a single response, often used with `planning` for generating reports or initial plans.
-* `no-onboarding`: Skips the initial onboarding process if it's not needed for a particular session.
+* `no-onboarding`: Skips the initial onboarding process if it's not needed for a particular session but retains the memory tools (assuming initial memories were created externally).
 * `onboarding`: Focuses on the project onboarding process.
-* `no-memories`: Disables all memory tools (and tools building on memories auch as onboarding tools)  
+* `no-memories`: Disables all memory tools (and tools building on memories such as onboarding tools)  
 
 Find the concrete definitions of these modes [here](https://github.com/oraios/serena/tree/main/src/serena/resources/config/modes).
 
