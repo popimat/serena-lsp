@@ -297,8 +297,35 @@ class Tool(Component):
             return msg
 
     @staticmethod
-    def _to_json(x: Any) -> str:
-        return json.dumps(x, ensure_ascii=False)
+    def _to_output(x: Any) -> str:
+        format_type = os.environ.get("SERENA_TOOL_OUTPUT_FORMAT", "yaml").lower()
+
+        if format_type == "json":
+            return json.dumps(x, ensure_ascii=False, indent=2)
+
+        from ruamel.yaml import YAML
+        from ruamel.yaml.scalarstring import PreservedScalarString
+
+        yaml = YAML()
+        yaml.default_flow_style = False
+        yaml.width = 4096  # Prevent line wrapping
+
+        def walk(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                return {k: walk(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [walk(v) for v in obj]
+            elif isinstance(obj, str):
+                if "\n" in obj:
+                    return PreservedScalarString(obj)
+                return obj
+            return obj
+
+        import io
+
+        stream = io.StringIO()
+        yaml.dump(walk(x), stream)
+        return stream.getvalue()
 
 
 class EditedFileContext:

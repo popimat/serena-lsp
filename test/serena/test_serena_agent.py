@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import shutil
+import tempfile
 import time
 
 import pytest
@@ -9,9 +11,98 @@ import test.solidlsp.clojure as clj
 from serena.agent import SerenaAgent
 from serena.config.serena_config import ProjectConfig, RegisteredProject, SerenaConfig
 from serena.project import Project
-from serena.tools import FindReferencingSymbolsTool, FindSymbolTool
+from serena.tools import (
+    FindReferencingSymbolsTool,
+    FindSymbolTool,
+    GetDefiningSymbolTool,
+    GetDefinitionLocationsTool,
+    GetHoverInfoTool,
+)
 from solidlsp.ls_config import Language
 from test.conftest import get_repo_path
+
+_ENVIRONMENT_FAILURE_MARKERS = {
+    "No space left on device": "insufficient disk space",
+    "not enough space on the disk": "insufficient disk space",
+}
+_DISK_HEAVY_LANGUAGES = {Language.JAVA, Language.CSHARP}
+_MIN_DISK_SPACE_MB = 500
+
+_UNAVAILABLE_LANGUAGE_FAILURES: dict[Language, str] = {}
+
+
+def _get_agent_primary_language(agent: SerenaAgent) -> Language | None:
+    project = agent.get_active_project_or_raise()
+    languages = project.project_config.languages
+    return languages[0] if languages else None
+
+
+def _get_environment_skip_reason(message: str) -> str | None:
+    for marker, summary in _ENVIRONMENT_FAILURE_MARKERS.items():
+        if marker in message:
+            return f"{summary} ({marker})"
+    return None
+
+
+def _has_critically_low_disk_space() -> tuple[bool, str]:
+    paths = {tempfile.gettempdir(), os.path.expanduser("~")}
+    min_free_mb: float | None = None
+    for path in paths:
+        try:
+            usage = shutil.disk_usage(path)
+        except FileNotFoundError:
+            continue
+        free_mb = usage.free / (1024 * 1024)
+        if min_free_mb is None or free_mb < min_free_mb:
+            min_free_mb = free_mb
+    if min_free_mb is not None and min_free_mb < _MIN_DISK_SPACE_MB:
+        return True, f"{min_free_mb:.1f} MB free"
+    return False, ""
+
+
+def _reset_language_server_manager_or_skip(agent: SerenaAgent) -> None:
+    language = _get_agent_primary_language(agent)
+    if language and language in _UNAVAILABLE_LANGUAGE_FAILURES:
+        pytest.skip(_UNAVAILABLE_LANGUAGE_FAILURES[language])
+    try:
+        agent.reset_language_server_manager()
+    except Exception as exc:  # pragma: no cover - defensive path for CI environments
+        reason = _get_environment_skip_reason(str(exc))
+        if not reason and language in _DISK_HEAVY_LANGUAGES:
+            low_disk, disk_summary = _has_critically_low_disk_space()
+            if low_disk:
+                reason = f"insufficient disk space ({disk_summary})"
+        if reason and language:
+            skip_message = f"{language.value} language server unavailable in test environment: {reason}"
+            _UNAVAILABLE_LANGUAGE_FAILURES[language] = skip_message
+            pytest.skip(skip_message)
+        raise
+
+
+def _normalize_relative_path(path: str | None) -> str | None:
+    if path is None:
+        return None
+    return path.replace("\\", "/")
+
+
+def _find_text_position(project_root: str, relative_path: str, search_text: str, occurrence_index: int = 0) -> tuple[int, int]:
+    file_path = os.path.join(project_root, relative_path)
+    with open(file_path, encoding="utf-8") as file_obj:
+        lines = file_obj.readlines()
+
+    remaining = occurrence_index
+    for line_no, line in enumerate(lines):
+        start = 0
+        while True:
+            idx = line.find(search_text, start)
+            if idx == -1:
+                break
+            if remaining == 0:
+                return line_no, idx
+            remaining -= 1
+            start = idx + 1
+
+    raise AssertionError(f"Could not find '{search_text}' in {relative_path}")
 
 
 @pytest.fixture
@@ -66,10 +157,28 @@ class TestSerenaAgent:
         "serena_agent,symbol_name,expected_kind,expected_file",
         [
             pytest.param(Language.PYTHON, "User", "Class", "models.py", marks=pytest.mark.python),
-            pytest.param(Language.GO, "Helper", "Function", "main.go", marks=pytest.mark.go),
+            pytest.param(
+                Language.GO,
+                "Helper",
+                "Function",
+                "main.go",
+                marks=pytest.mark.go,
+            ),
             pytest.param(Language.JAVA, "Model", "Class", "Model.java", marks=pytest.mark.java),
-            pytest.param(Language.KOTLIN, "Model", "Struct", "Model.kt", marks=pytest.mark.kotlin),
-            pytest.param(Language.RUST, "add", "Function", "lib.rs", marks=pytest.mark.rust),
+            pytest.param(
+                Language.KOTLIN,
+                "Model",
+                "Struct",
+                "Model.kt",
+                marks=pytest.mark.kotlin,
+            ),
+            pytest.param(
+                Language.RUST,
+                "add",
+                "Function",
+                "lib.rs",
+                marks=pytest.mark.rust,
+            ),
             pytest.param(Language.TYPESCRIPT, "DemoClass", "Class", "index.ts", marks=pytest.mark.typescript),
             pytest.param(Language.PHP, "helperFunction", "Function", "helper.php", marks=pytest.mark.php),
             pytest.param(
@@ -85,6 +194,7 @@ class TestSerenaAgent:
     )
     def test_find_symbol(self, serena_agent, symbol_name: str, expected_kind: str, expected_file: str):
         agent = serena_agent
+        _reset_language_server_manager_or_skip(agent)
         find_symbol_tool = agent.get_tool(FindSymbolTool)
         result = find_symbol_tool.apply_ex(name_path_pattern=symbol_name)
 
@@ -93,6 +203,66 @@ class TestSerenaAgent:
             symbol_name in s["name_path"] and expected_kind.lower() in s["kind"].lower() and expected_file in s["relative_path"]
             for s in symbols
         ), f"Expected to find {symbol_name} ({expected_kind}) in {expected_file}"
+
+    @pytest.mark.parametrize(
+        "serena_agent,relative_path,line,character,expected_content",
+        [
+            pytest.param(
+                Language.PYTHON,
+                os.path.join("test_repo", "models.py"),
+                31,
+                10,
+                "User",
+                marks=pytest.mark.python,
+            ),
+            pytest.param(
+                Language.GO,
+                "main.go",
+                9,
+                5,
+                "Helper",
+                marks=pytest.mark.go,
+            ),
+            pytest.param(Language.JAVA, os.path.join("src", "main", "java", "test_repo", "Model.java"), 2, 13, "Model", marks=pytest.mark.java),
+            pytest.param(
+                Language.KOTLIN,
+                os.path.join("src", "main", "kotlin", "test_repo", "Model.kt"),
+                2,
+                11,
+                "Model",
+                marks=pytest.mark.kotlin,
+            ),
+            pytest.param(
+                Language.RUST,
+                os.path.join("src", "lib.rs"),
+                1,
+                7,
+                "add",
+                marks=pytest.mark.rust,
+            ),
+            pytest.param(Language.TYPESCRIPT, "index.ts", 0, 13, "DemoClass", marks=pytest.mark.typescript),
+            pytest.param(Language.PHP, "helper.php", 2, 9, "helperFunction", marks=pytest.mark.php),
+            pytest.param(Language.CSHARP, "Program.cs", 10, 20, "Calculator", marks=pytest.mark.csharp),
+            pytest.param(
+                Language.CLOJURE,
+                clj.CORE_PATH,
+                2,
+                6,
+                "greet",
+                marks=[pytest.mark.clojure, pytest.mark.skipif(clj.CLI_FAIL, reason=f"Clojure CLI not available: {clj.CLI_FAIL}")],
+            ),
+        ],
+        indirect=["serena_agent"],
+    )
+    def test_get_hover_info(self, serena_agent, relative_path: str, line: int, character: int, expected_content: str):
+        agent = serena_agent
+        # Ensure LS is initialized
+        _reset_language_server_manager_or_skip(agent)
+
+        tool = agent.get_tool(GetHoverInfoTool)
+        result = tool.apply(relative_path=relative_path, line=line, character=character)
+
+        assert expected_content in result
 
     @pytest.mark.parametrize(
         "serena_agent,symbol_name,def_file,ref_file",
@@ -104,7 +274,13 @@ class TestSerenaAgent:
                 os.path.join("test_repo", "services.py"),
                 marks=pytest.mark.python,
             ),
-            pytest.param(Language.GO, "Helper", "main.go", "main.go", marks=pytest.mark.go),
+            pytest.param(
+                Language.GO,
+                "Helper",
+                "main.go",
+                "main.go",
+                marks=pytest.mark.go,
+            ),
             pytest.param(
                 Language.JAVA,
                 "Model",
@@ -119,7 +295,13 @@ class TestSerenaAgent:
                 os.path.join("src", "main", "kotlin", "test_repo", "Main.kt"),
                 marks=pytest.mark.kotlin,
             ),
-            pytest.param(Language.RUST, "add", os.path.join("src", "lib.rs"), os.path.join("src", "main.rs"), marks=pytest.mark.rust),
+            pytest.param(
+                Language.RUST,
+                "add",
+                os.path.join("src", "lib.rs"),
+                os.path.join("src", "main.rs"),
+                marks=pytest.mark.rust,
+            ),
             pytest.param(Language.TYPESCRIPT, "helperFunction", "index.ts", "use_helper.ts", marks=pytest.mark.typescript),
             pytest.param(Language.PHP, "helperFunction", "helper.php", "index.php", marks=pytest.mark.php),
             pytest.param(
@@ -135,6 +317,7 @@ class TestSerenaAgent:
     )
     def test_find_symbol_references(self, serena_agent, symbol_name: str, def_file: str, ref_file: str) -> None:
         agent = serena_agent
+        _reset_language_server_manager_or_skip(agent)
 
         # Find the symbol location first
         find_symbol_tool = agent.get_tool(FindSymbolTool)
@@ -153,6 +336,271 @@ class TestSerenaAgent:
         assert any(
             ref["relative_path"] == ref_file for ref in refs
         ), f"Expected to find reference to {symbol_name} in {ref_file}. refs={refs}"
+
+    @pytest.mark.parametrize(
+        "serena_agent,reference_path,search_text,expected_definition_path,expected_symbol_name,expected_symbol_kind,occurrence_index",
+        [
+            pytest.param(
+                Language.PYTHON,
+                os.path.join("test_repo", "services.py"),
+                "User(",
+                os.path.join("test_repo", "models.py"),
+                "User",
+                "Class",
+                0,
+                marks=pytest.mark.python,
+            ),
+            pytest.param(
+                Language.GO,
+                "main.go",
+                "Helper()",
+                "main.go",
+                "Helper",
+                "Function",
+                1,
+                marks=pytest.mark.go,
+            ),
+            pytest.param(
+                Language.JAVA,
+                os.path.join("src", "main", "java", "test_repo", "Main.java"),
+                "Model(",
+                os.path.join("src", "main", "java", "test_repo", "Model.java"),
+                "Model",
+                "Class",
+                0,
+                marks=pytest.mark.java,
+            ),
+            pytest.param(
+                Language.KOTLIN,
+                os.path.join("src", "main", "kotlin", "test_repo", "Main.kt"),
+                "Model(",
+                os.path.join("src", "main", "kotlin", "test_repo", "Model.kt"),
+                "Model",
+                "Class",
+                0,
+                marks=pytest.mark.kotlin,
+            ),
+            pytest.param(
+                Language.RUST,
+                os.path.join("src", "main.rs"),
+                "add()",
+                os.path.join("src", "lib.rs"),
+                "add",
+                "Function",
+                0,
+                marks=pytest.mark.rust,
+            ),
+            pytest.param(
+                Language.TYPESCRIPT,
+                "index.ts",
+                "DemoClass(",
+                "index.ts",
+                "DemoClass",
+                "Class",
+                0,
+                marks=pytest.mark.typescript,
+            ),
+            pytest.param(
+                Language.PHP,
+                "index.php",
+                "helperFunction();",
+                "helper.php",
+                "helperFunction",
+                "Function",
+                0,
+                marks=pytest.mark.php,
+            ),
+            pytest.param(
+                Language.CSHARP,
+                "Program.cs",
+                "Calculator();",
+                "Program.cs",
+                "Calculator",
+                "Class",
+                0,
+                marks=pytest.mark.csharp,
+            ),
+            pytest.param(
+                Language.CLOJURE,
+                clj.UTILS_PATH,
+                "core/multiply",
+                clj.CORE_PATH,
+                "multiply",
+                "Function",
+                0,
+                marks=[pytest.mark.clojure, pytest.mark.skipif(clj.CLI_FAIL, reason=f"Clojure CLI not available: {clj.CLI_FAIL}")],
+            ),
+        ],
+        indirect=["serena_agent"],
+    )
+    def test_get_definition_locations(
+        self,
+        serena_agent,
+        reference_path: str,
+        search_text: str,
+        expected_definition_path: str,
+        expected_symbol_name: str,
+        expected_symbol_kind: str,
+        occurrence_index: int,
+    ) -> None:
+        agent = serena_agent
+        _reset_language_server_manager_or_skip(agent)
+        project = agent.get_active_project_or_raise()
+
+        line, character = _find_text_position(project.project_root, reference_path, search_text, occurrence_index)
+        tool = agent.get_tool(GetDefinitionLocationsTool)
+        result = tool.apply(relative_path=reference_path, line=line, character=character)
+
+        definitions = json.loads(result)
+        assert definitions, f"Expected definitions for {reference_path}:{line}:{character}"
+        normalized_results = {
+            _normalize_relative_path(entry.get("relative_path")) for entry in definitions if entry.get("relative_path")
+        }
+        expected_normalized = _normalize_relative_path(expected_definition_path)
+        assert expected_normalized in normalized_results
+
+    @pytest.mark.parametrize(
+        "serena_agent,reference_path,search_text,expected_definition_path,expected_symbol_name,expected_symbol_kind,occurrence_index",
+        [
+            pytest.param(
+                Language.PYTHON,
+                os.path.join("test_repo", "services.py"),
+                "User(",
+                os.path.join("test_repo", "models.py"),
+                "User",
+                "Class",
+                0,
+                marks=pytest.mark.python,
+            ),
+            pytest.param(
+                Language.GO,
+                "main.go",
+                "Helper()",
+                "main.go",
+                "Helper",
+                "Function",
+                1,
+                marks=pytest.mark.go,
+            ),
+            pytest.param(
+                Language.JAVA,
+                os.path.join("src", "main", "java", "test_repo", "Main.java"),
+                "Model(",
+                os.path.join("src", "main", "java", "test_repo", "Model.java"),
+                "Model",
+                "Class",
+                0,
+                marks=pytest.mark.java,
+            ),
+            pytest.param(
+                Language.KOTLIN,
+                os.path.join("src", "main", "kotlin", "test_repo", "Main.kt"),
+                "Model(",
+                os.path.join("src", "main", "kotlin", "test_repo", "Model.kt"),
+                "Model",
+                "Class",
+                0,
+                marks=pytest.mark.kotlin,
+            ),
+            pytest.param(
+                Language.RUST,
+                os.path.join("src", "main.rs"),
+                "add()",
+                os.path.join("src", "lib.rs"),
+                "add",
+                "Function",
+                0,
+                marks=pytest.mark.rust,
+            ),
+            pytest.param(
+                Language.TYPESCRIPT,
+                "index.ts",
+                "DemoClass(",
+                "index.ts",
+                "DemoClass",
+                "Class",
+                0,
+                marks=pytest.mark.typescript,
+            ),
+            pytest.param(
+                Language.PHP,
+                "index.php",
+                "helperFunction();",
+                "helper.php",
+                "helperFunction",
+                "Function",
+                0,
+                marks=[pytest.mark.php, pytest.mark.xfail(reason="PHP language server does not expose defining symbol metadata for helperFunction")],
+            ),
+            pytest.param(
+                Language.CSHARP,
+                "Program.cs",
+                "Calculator();",
+                "Program.cs",
+                "Calculator",
+                "Class",
+                0,
+                marks=pytest.mark.csharp,
+            ),
+            pytest.param(
+                Language.CLOJURE,
+                clj.UTILS_PATH,
+                "core/multiply",
+                clj.CORE_PATH,
+                "multiply",
+                "Function",
+                0,
+                marks=[pytest.mark.clojure, pytest.mark.skipif(clj.CLI_FAIL, reason=f"Clojure CLI not available: {clj.CLI_FAIL}")],
+            ),
+        ],
+        indirect=["serena_agent"],
+    )
+    def test_get_defining_symbol(
+        self,
+        serena_agent,
+        reference_path: str,
+        search_text: str,
+        expected_definition_path: str,
+        expected_symbol_name: str,
+        expected_symbol_kind: str,
+        occurrence_index: int,
+    ) -> None:
+        agent = serena_agent
+        _reset_language_server_manager_or_skip(agent)
+        project = agent.get_active_project_or_raise()
+
+        line, character = _find_text_position(project.project_root, reference_path, search_text, occurrence_index)
+        tool = agent.get_tool(GetDefiningSymbolTool)
+        result = tool.apply(relative_path=reference_path, line=line, character=character)
+
+        payload = json.loads(result)
+        symbol_info = payload.get("symbol")
+        assert symbol_info is not None, f"Expected defining symbol for {reference_path}:{line}:{character}. Payload={payload}"
+        assert symbol_info["name"].endswith(expected_symbol_name)
+        kind_value = symbol_info.get("kind", "")
+        assert isinstance(kind_value, str)
+        assert expected_symbol_kind.lower() in kind_value.lower()
+        location = symbol_info.get("location", {})
+        # Location can be a compact string like "path:line:col-line:col" or a dict with relativePath
+        if isinstance(location, str):
+            # Extract path from compact format by removing the trailing ":line:col-line:col" portion
+            import re
+            match = re.match(r"^(.+?):\d+:\d+-\d+:\d+$", location)
+            if match:
+                location_path = match.group(1)
+            else:
+                location_path = location
+        else:
+            location_path = location.get("relativePath")
+        assert _normalize_relative_path(location_path) == _normalize_relative_path(expected_definition_path)
+
+        definitions = payload.get("definitions", [])
+        normalized_defs = {
+            _normalize_relative_path(entry.get("relative_path")) for entry in definitions if entry.get("relative_path")
+        }
+        expected_normalized = _normalize_relative_path(expected_definition_path)
+        assert expected_normalized in normalized_defs
+
 
     @pytest.mark.parametrize(
         "serena_agent,name_path,substring_matching,expected_symbol_name,expected_kind,expected_file",
@@ -230,6 +678,7 @@ class TestSerenaAgent:
         expected_file: str,
     ):
         agent = serena_agent
+        _reset_language_server_manager_or_skip(agent)
 
         find_symbol_tool = agent.get_tool(FindSymbolTool)
         result = find_symbol_tool.apply_ex(
@@ -274,6 +723,7 @@ class TestSerenaAgent:
         name_path: str,
     ):
         agent = serena_agent
+        _reset_language_server_manager_or_skip(agent)
 
         find_symbol_tool = agent.get_tool(FindSymbolTool)
         result = find_symbol_tool.apply_ex(

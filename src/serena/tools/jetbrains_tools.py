@@ -42,9 +42,9 @@ class JetBrainsFindSymbolTool(Tool, ToolMarkerSymbolicRead, ToolMarkerOptional):
             If you have some knowledge about the codebase, you should use this parameter, as it will significantly
             speed up the search as well as reduce the number of results.
         :param include_body: If True, include the symbol's source code. Use judiciously.
-        :param max_answer_chars: max characters for the JSON result. If exceeded, no content is returned.
+        :param max_answer_chars: max characters for the result. If exceeded, no content is returned.
             -1 means the default value from the config will be used.
-        :return: JSON string: a list of symbols (with locations) matching the name.
+        :return: serialized string (YAML/JSON): a list of symbols (with locations) matching the name.
         """
         with JetBrainsPluginClient.from_project(self.project) as client:
             response_dict = client.find_symbol(
@@ -53,7 +53,7 @@ class JetBrainsFindSymbolTool(Tool, ToolMarkerSymbolicRead, ToolMarkerOptional):
                 depth=depth,
                 include_body=include_body,
             )
-            result = self._to_json(response_dict)
+            result = self._to_output(response_dict)
         return self._limit_length(result, max_answer_chars)
 
 
@@ -75,16 +75,16 @@ class JetBrainsFindReferencingSymbolsTool(Tool, ToolMarkerSymbolicRead, ToolMark
         :param name_path: name path of the symbol for which to find references; matching logic as described in find symbol tool.
         :param relative_path: the relative path to the file containing the symbol for which to find references.
             Note that here you can't pass a directory but must pass a file.
-        :param max_answer_chars: max characters for the JSON result. If exceeded, no content is returned. -1 means the
+        :param max_answer_chars: max characters for the result. If exceeded, no content is returned. -1 means the
             default value from the config will be used.
-        :return: a list of JSON objects with the symbols referencing the requested symbol
+        :return: a list of serialized objects (YAML/JSON) with the symbols referencing the requested symbol
         """
         with JetBrainsPluginClient.from_project(self.project) as client:
             response_dict = client.find_references(
                 name_path=name_path,
                 relative_path=relative_path,
             )
-            result = self._to_json(response_dict)
+            result = self._to_output(response_dict)
         return self._limit_length(result, max_answer_chars)
 
 
@@ -106,13 +106,13 @@ class JetBrainsGetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead, ToolMarkerOp
         or by using the `list_dir` and `find_file` tools (or similar).
 
         :param relative_path: the relative path to the file to get the overview of
-        :param max_answer_chars: max characters for the JSON result. If exceeded, no content is returned.
+        :param max_answer_chars: max characters for the result. If exceeded, no content is returned.
             -1 means the default value from the config will be used.
-        :return: a JSON object containing the symbols
+        :return: a serialized object (YAML/JSON) containing the symbols
         """
         with JetBrainsPluginClient.from_project(self.project) as client:
             response_dict = client.get_symbols_overview(
                 relative_path=relative_path,
             )
-            result = self._to_json(response_dict)
+            result = self._to_output(response_dict)
         return self._limit_length(result, max_answer_chars)

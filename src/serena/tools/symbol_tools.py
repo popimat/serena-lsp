@@ -18,6 +18,12 @@ from serena.tools.tools_base import ToolMarkerOptional
 from solidlsp.ls_types import SymbolKind
 
 
+def _format_range(rng: dict[str, Any]) -> str:
+    start = rng["start"]
+    end = rng["end"]
+    return f"{start['line'] + 1}:{start['character'] + 1}-{end['line'] + 1}:{end['character'] + 1}"
+
+
 def _sanitize_symbol_dict(symbol_dict: dict[str, Any]) -> dict[str, Any]:
     """
     Sanitize a symbol dictionary inplace by removing unnecessary information.
@@ -29,9 +35,43 @@ def _sanitize_symbol_dict(symbol_dict: dict[str, Any]) -> dict[str, Any]:
     if s_relative_path is not None:
         symbol_dict["relative_path"] = s_relative_path
     symbol_dict.pop("location", None)
+
+    rng = symbol_dict.get("range")
+    if rng:
+        symbol_dict["range"] = _format_range(rng)
+
     # also remove name, name_path should be enough
     symbol_dict.pop("name")
     return symbol_dict
+
+
+def _clean_none_and_empty(obj: Any) -> Any:
+    """
+    Recursively remove None values and empty lists/dicts from a dictionary or list.
+    """
+    if isinstance(obj, dict):
+        return {
+            k: v
+            for k, v in ((k, _clean_none_and_empty(v)) for k, v in obj.items())
+            if v is not None and (not isinstance(v, (list, dict)) or len(v) > 0)
+        }
+    if isinstance(obj, list):
+        return [
+            v
+            for v in (_clean_none_and_empty(v) for v in obj)
+            if v is not None and (not isinstance(v, (list, dict)) or len(v) > 0)
+        ]
+    return obj
+
+
+class _LanguageServerToolMixin:
+    """Helper mixin for tools that need direct language server access."""
+
+    def _get_language_server(self, relative_path: str):
+        if not self.agent.is_using_language_server():
+            raise RuntimeError("Cannot create LanguageServer; agent is not in language server mode.")
+        language_server_manager = self.agent.get_language_server_manager_or_raise()
+        return language_server_manager.get_language_server(relative_path)
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
@@ -60,7 +100,7 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
         :param max_answer_chars: if the overview is longer than this number of characters,
             no content will be returned. -1 means the default value from the config will be used.
             Don't adjust unless there is really no other way to get the content required for the task.
-        :return: a JSON object containing info about top-level symbols in the file
+        :return: a serialized object (YAML/JSON) containing info about top-level symbols in the file
         """
         symbol_retriever = self.create_language_server_symbol_retriever()
         file_path = os.path.join(self.project.project_root, relative_path)
@@ -72,8 +112,8 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
         if os.path.isdir(file_path):
             raise ValueError(f"Expected a file path, but got a directory path: {relative_path}. ")
         result = symbol_retriever.get_symbol_overview(relative_path)[relative_path]
-        result_json_str = self._to_json([dataclasses.asdict(i) for i in result])
-        return self._limit_length(result_json_str, max_answer_chars)
+        result_str = self._to_output([dataclasses.asdict(i) for i in result])
+        return self._limit_length(result_str, max_answer_chars)
 
 
 class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
@@ -129,7 +169,7 @@ class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
             If not provided, no kinds are excluded.
         :param substring_matching: If True, use substring matching for the last element of the pattern, such that
             "Foo/get" would match "Foo/getValue" and "Foo/getData".
-        :param max_answer_chars: Max characters for the JSON result. If exceeded, no content is returned.
+        :param max_answer_chars: Max characters for the result. If exceeded, no content is returned.
             -1 means the default value from the config will be used.
         :return: a list of symbols (with locations) matching the name.
         """
@@ -144,7 +184,7 @@ class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
             within_relative_path=relative_path,
         )
         symbol_dicts = [_sanitize_symbol_dict(s.to_dict(kind=True, location=True, depth=depth, include_body=include_body)) for s in symbols]
-        result = self._to_json(symbol_dicts)
+        result = self._to_output(symbol_dicts)
         return self._limit_length(result, max_answer_chars)
 
 
@@ -172,7 +212,7 @@ class FindReferencingSymbolsTool(Tool, ToolMarkerSymbolicRead):
         :param include_kinds: same as in the `find_symbol` tool.
         :param exclude_kinds: same as in the `find_symbol` tool.
         :param max_answer_chars: same as in the `find_symbol` tool.
-        :return: a list of JSON objects with the symbols referencing the requested symbol
+        :return: a list of serialized objects (YAML/JSON) with the symbols referencing the requested symbol
         """
         include_body = False  # It is probably never a good idea to include the body of the referencing symbols
         parsed_include_kinds: Sequence[SymbolKind] | None = [SymbolKind(k) for k in include_kinds] if include_kinds else None
@@ -197,7 +237,7 @@ class FindReferencingSymbolsTool(Tool, ToolMarkerSymbolicRead):
                 )
                 ref_dict["content_around_reference"] = content_around_ref.to_display_string()
             reference_dicts.append(ref_dict)
-        result = self._to_json(reference_dicts)
+        result = self._to_output(reference_dicts)
         return self._limit_length(result, max_answer_chars)
 
 
@@ -308,3 +348,253 @@ class RenameSymbolTool(Tool, ToolMarkerSymbolicEdit):
         code_editor = self.create_code_editor()
         status_message = code_editor.rename_symbol(name_path, relative_file_path=relative_path, new_name=new_name)
         return status_message
+
+
+class GetHoverInfoTool(_LanguageServerToolMixin, Tool, ToolMarkerSymbolicRead):
+    """
+    Gets hover information for a symbol at a specific location in a file.
+    """
+
+    def apply(self, relative_path: str, line: int, character: int) -> str:
+        """
+        Retrieves hover information (documentation, type info, etc.) for the code at the specified position.
+        This is equivalent to hovering over the code in an IDE.
+
+        :param relative_path: the relative path to the file
+        :param line: the line number (0-based)
+        :param character: the character offset (0-based)
+        :return: the hover information as a string
+        """
+        ls = self._get_language_server(relative_path)
+        result = ls.request_hover(relative_path, line, character)
+        if result is None:
+            return "No hover information available."
+
+        # Format the result
+        contents = result.get("contents")
+        if not contents:
+            return "No content in hover result."
+
+        if isinstance(contents, str):
+            return contents
+        elif isinstance(contents, dict):
+            return contents.get("value", str(contents))
+        elif isinstance(contents, list):
+            # List of MarkedString or string
+            parts = []
+            for part in contents:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    parts.append(part.get("value", str(part)))
+            return "\n\n".join(parts)
+
+        return str(contents)
+
+
+def _format_definition_entries(definitions: list[dict[str, Any]], project_root: str, project) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for definition in definitions:
+        definition_path = definition.get("relativePath")
+        absolute_definition_path = definition.get("absolutePath")
+
+        if definition_path is None and absolute_definition_path is not None:
+            definition_path = os.path.relpath(absolute_definition_path, project_root)
+
+        snippet = None
+        if definition_path is not None:
+            display = project.retrieve_content_around_line(
+                relative_file_path=definition_path,
+                line=definition["range"]["start"]["line"],
+                context_lines_before=2,
+                context_lines_after=2,
+            )
+            snippet = display.to_display_string()
+
+        rng = definition.get("range")
+        formatted_range = _format_range(rng) if rng else None
+
+        entry = {
+            "relative_path": definition_path,
+            "range": formatted_range,
+            "snippet": snippet,
+        }
+        # Only include uri if we couldn't determine a relative path
+        if definition_path is None:
+            entry["uri"] = definition.get("uri")
+            
+        entries.append(entry)
+
+    return entries
+
+
+class GetDefinitionLocationsTool(_LanguageServerToolMixin, Tool, ToolMarkerSymbolicRead):
+    """Retrieves the definition locations for the symbol at a given file position."""
+
+    def apply(self, relative_path: str, line: int, character: int, max_answer_chars: int = -1) -> str:
+        """
+        Retrieves the definition locations for the symbol at the given file position.
+
+        :param relative_path: the relative path to the file
+        :param line: 0-indexed line number
+        :param character: 0-indexed character position
+        :param max_answer_chars: Optional maximum number of characters in the answer. Default uses the configured limit.
+        :return: A list of definition locations with file paths and ranges.
+        """
+        ls = self._get_language_server(relative_path)
+        definitions = ls.request_definition(relative_path, line, character)
+        definition_entries = _format_definition_entries(definitions, self.project.project_root, self.project)
+
+        payload = self._to_output(_clean_none_and_empty(definition_entries))
+        return self._limit_length(payload, max_answer_chars)
+
+
+def _format_reference_entries(references: list[dict[str, Any]], project_root: str, project) -> list[dict[str, Any]]:
+    """Format LSP reference locations into a structured list with snippets."""
+    entries: list[dict[str, Any]] = []
+    for ref in references:
+        ref_path = ref.get("relativePath")
+        absolute_ref_path = ref.get("absolutePath")
+
+        if ref_path is None and absolute_ref_path is not None:
+            ref_path = os.path.relpath(absolute_ref_path, project_root)
+
+        snippet = None
+        if ref_path is not None:
+            rng = ref.get("range")
+            if rng:
+                display = project.retrieve_content_around_line(
+                    relative_file_path=ref_path,
+                    line=rng["start"]["line"],
+                    context_lines_before=2,
+                    context_lines_after=2,
+                )
+                snippet = display.to_display_string()
+
+        rng = ref.get("range")
+        formatted_range = _format_range(rng) if rng else None
+
+        entry = {
+            "relative_path": ref_path,
+            "range": formatted_range,
+            "snippet": snippet,
+        }
+        # Only include uri if we couldn't determine a relative path
+        if ref_path is None:
+            entry["uri"] = ref.get("uri")
+
+        entries.append(entry)
+
+    return entries
+
+
+class GetReferenceLocationsTool(_LanguageServerToolMixin, Tool, ToolMarkerSymbolicRead):
+    """Retrieves all reference locations for the symbol at a given file position."""
+
+    def apply(self, relative_path: str, line: int, character: int, max_answer_chars: int = -1) -> str:
+        """
+        Retrieves all locations where the symbol at the given position is referenced.
+
+        :param relative_path: the relative path to the file
+        :param line: 0-indexed line number
+        :param character: 0-indexed character position
+        :param max_answer_chars: Optional maximum number of characters in the answer. Default uses the configured limit.
+        :return: A list of reference locations with file paths, ranges, and code snippets.
+        """
+        ls = self._get_language_server(relative_path)
+        references = ls.request_references(relative_path, line, character)
+        reference_entries = _format_reference_entries(references, self.project.project_root, self.project)
+
+        payload = self._to_output(_clean_none_and_empty(reference_entries))
+        return self._limit_length(payload, max_answer_chars)
+
+
+def _serialize_symbol(symbol: dict[str, Any]) -> dict[str, Any]:
+    serialized = copy(symbol)
+    # Remove fields that are not useful for the LLM
+    serialized.pop("parent", None)
+    serialized.pop("glyph", None)
+    serialized.pop("selectionRange", None)
+
+    kind_value = serialized.get("kind")
+    if isinstance(kind_value, SymbolKind):
+        serialized["kind"] = kind_value.name
+    elif isinstance(kind_value, int):
+        try:
+            serialized["kind"] = SymbolKind(kind_value).name
+        except ValueError:
+            serialized["kind"] = str(kind_value)
+
+    children = serialized.get("children")
+    if isinstance(children, list):
+        serialized["children"] = [_serialize_symbol(child) for child in children]
+
+    rng = serialized.get("range")
+    if rng:
+        serialized["range"] = _format_range(rng)
+
+    location = serialized.get("location")
+    if location is not None:
+        loc_dict = dict(location)
+        path = loc_dict.get("relativePath")
+        if not path:
+            path = loc_dict.get("uri")
+
+        loc_rng = loc_dict.get("range")
+        if path and loc_rng:
+            serialized["location"] = f"{path}:{_format_range(loc_rng)}"
+        else:
+            # Fallback if something is missing
+            if loc_dict.get("relativePath"):
+                loc_dict.pop("uri", None)
+                loc_dict.pop("absolutePath", None)
+            serialized["location"] = loc_dict
+
+    body = serialized.get("body")
+    if isinstance(body, str):
+        import textwrap
+
+        lines = body.splitlines()
+        if lines:
+            # The first line is often the declaration and might have different indentation
+            # (or be stripped already) compared to the body block.
+            # We strip the first line and dedent the rest.
+            first_line = lines[0].lstrip()
+            if len(lines) > 1:
+                # Remove common indentation from the rest
+                rest = textwrap.dedent("\n".join(lines[1:]))
+                serialized["body"] = first_line + "\n" + rest
+            else:
+                serialized["body"] = first_line
+
+    return serialized
+
+
+class GetDefiningSymbolTool(_LanguageServerToolMixin, Tool, ToolMarkerSymbolicRead):
+    """Retrieves the defining symbol (with optional body) for the code at a given location."""
+
+    def apply(self, relative_path: str, line: int, character: int, include_body: bool = False, max_answer_chars: int = -1) -> str:
+        """
+        Retrieves the defining symbol for the code at the given file position.
+
+        :param relative_path: the relative path to the file
+        :param line: 0-indexed line number
+        :param character: 0-indexed character position
+        :param include_body: whether to include the symbol's body/implementation
+        :param max_answer_chars: Optional maximum number of characters in the answer. Default uses the configured limit.
+        :return: Symbol information including location and optionally the body.
+        """
+        ls = self._get_language_server(relative_path)
+        symbol = ls.request_defining_symbol(relative_path, line, character, include_body=include_body)
+        definitions = ls.request_definition(relative_path, line, character)
+        definition_entries = _format_definition_entries(definitions, self.project.project_root, self.project)
+
+        payload: dict[str, Any] = {
+            "symbol": _serialize_symbol(symbol) if symbol is not None else None,
+            "definitions": definition_entries,
+        }
+        if symbol is None:
+            payload["error"] = "No defining symbol found."
+
+        output_payload = self._to_output(_clean_none_and_empty(payload))
+        return self._limit_length(output_payload, max_answer_chars)

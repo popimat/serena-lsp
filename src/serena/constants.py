@@ -1,10 +1,12 @@
+import os
 from pathlib import Path
 
 _repo_root_path = Path(__file__).parent.parent.parent.resolve()
 _serena_pkg_path = Path(__file__).parent.resolve()
 
 SERENA_MANAGED_DIR_NAME = ".serena"
-_serena_in_home_managed_dir = Path.home() / ".serena"
+_serena_home_override = os.environ.get("SERENA_HOME")
+_serena_in_home_managed_dir = Path(_serena_home_override).expanduser() if _serena_home_override else Path.home() / ".serena"
 
 SERENA_MANAGED_DIR_IN_HOME = str(_serena_in_home_managed_dir)
 

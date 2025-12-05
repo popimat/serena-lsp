@@ -96,7 +96,7 @@ class ListDirTool(Tool):
         :param max_answer_chars: if the output is longer than this number of characters,
             no content will be returned. -1 means the default value from the config will be used.
             Don't adjust unless there is really no other way to get the content required for the task.
-        :return: a JSON object with the names of directories and files within the given directory
+        :return: a serialized object (YAML/JSON) with the names of directories and files within the given directory
         """
         # Check if the directory exists before validation
         if not self.project.relative_path_exists(relative_path):
@@ -105,7 +105,7 @@ class ListDirTool(Tool):
                 "project_root": self.get_project_root(),
                 "hint": "Check if the path is correct relative to the project root",
             }
-            return self._to_json(error_info)
+            return self._to_output(error_info)
 
         self.project.validate_relative_path(relative_path, require_not_ignored=skip_ignored_files)
 
@@ -117,7 +117,7 @@ class ListDirTool(Tool):
             is_ignored_file=self.project.is_ignored_path if skip_ignored_files else None,
         )
 
-        result = self._to_json({"dirs": dirs, "files": files})
+        result = self._to_output({"dirs": dirs, "files": files})
         return self._limit_length(result, max_answer_chars)
 
 
@@ -132,7 +132,7 @@ class FindFileTool(Tool):
 
         :param file_mask: the filename or file mask (using the wildcards * or ?) to search for
         :param relative_path: the relative path to the directory to search in; pass "." to scan the project root
-        :return: a JSON object with the list of matching files
+        :return: a serialized object (YAML/JSON) with the list of matching files
         """
         self.project.validate_relative_path(relative_path, require_not_ignored=True)
 
@@ -153,7 +153,7 @@ class FindFileTool(Tool):
             relative_to=self.get_project_root(),
         )
 
-        result = self._to_json({"files": files})
+        result = self._to_output({"files": files})
         return result
 
 
@@ -439,5 +439,5 @@ class SearchForPatternTool(Tool):
         for match in matches:
             assert match.source_file_path is not None
             file_to_matches[match.source_file_path].append(match.to_display_string())
-        result = self._to_json(file_to_matches)
+        result = self._to_output(file_to_matches)
         return self._limit_length(result, max_answer_chars)

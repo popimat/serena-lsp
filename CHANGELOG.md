@@ -23,6 +23,8 @@ Status of the `main` branch. Changes prior to the next official version change w
     * Add notion of a "single-project context" (flag `single_project`), allowing user-defined contexts to behave 
       like the built-in `ide-assistant` context (where the available tools are restricted to ones required by the active 
       project and project changes are disabled)
+    * **Add `SERENA_HOME` environment variable support**: Set this to redirect all Serena data (logs, caches, language servers, config) to a custom location instead of `~/.serena`
+    * **Tool output format now configurable**: Set `SERENA_TOOL_OUTPUT_FORMAT=yaml` (default) or `json` to control tool output serialization
 
 * Client support:
     * New mode `oaicompat-agent` and extensions enhancing OpenAI tool compatibility, permitting Serena to work with llama.cpp
@@ -30,7 +32,8 @@ Status of the `main` branch. Changes prior to the next official version change w
 * Tools:
   * Added `RenameSymbolTool` for renaming symbols across the codebase (if LS supports this operation).
   * Replaced `ReplaceRegexTool` with `ReplaceContentTool`, which supports both plain text and regex-based replacements
-    (and which requires no escaping in the replacement text, making it more robust) 
+    (and which requires no escaping in the replacement text, making it more robust)
+  * Added `GetReferenceLocationsTool` for finding all references to a symbol at a given file position (using LSP `textDocument/references`) 
 
 * Language support:
 

@@ -8,6 +8,10 @@ Serena is configured in four places:
 
 1. The `serena_config.yml` for general settings that apply to all clients and projects.
    It is located in your user directory under `.serena/serena_config.yml`.
+   If you prefer to keep Serena's data (logs, caches, downloaded language servers, etc.) on a different drive,
+   set the environment variable `SERENA_HOME` to an absolute path (for example `D:\\serena-data`) **before**
+   launching Serena. All files that would normally live under `%USERPROFILE%\.serena` will then be stored in
+   `<SERENA_HOME>\.serena` instead, including the `language_servers/static` download cache.
    If you do not explicitly create the file, it will be auto-generated when you first run Serena.
    You can edit it directly or use
 
