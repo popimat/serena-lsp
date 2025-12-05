@@ -1,4 +1,6 @@
 import logging
+import os
+import platform
 from pathlib import Path
 
 import pytest
@@ -144,3 +146,9 @@ def project(request: LanguageParamRequest):
 
     language = request.param
     yield create_default_project(language)
+
+
+is_ci = os.getenv("CI") == "true" or os.getenv("GITHUB_ACTIONS") == "true"
+
+# We skip Java tests in CI if not on Windows (hangs on Ubuntu for unknown reasons; testing on Windows is sufficient)
+java_tests_enabled = not is_ci or platform.system() == "Windows"

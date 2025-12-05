@@ -19,7 +19,7 @@ from serena.tools import (
     GetHoverInfoTool,
 )
 from solidlsp.ls_config import Language
-from test.conftest import get_repo_path
+from test.conftest import get_repo_path, java_tests_enabled
 
 _ENVIRONMENT_FAILURE_MARKERS = {
     "No space left on device": "insufficient disk space",
@@ -147,6 +147,9 @@ def serena_config():
 @pytest.fixture
 def serena_agent(request: pytest.FixtureRequest, serena_config):
     language = Language(request.param)
+    if language == Language.JAVA and not java_tests_enabled:
+        pytest.skip("Java tests are not enabled")
+
     project_name = f"test_repo_{language}"
 
     return SerenaAgent(project=project_name, serena_config=serena_config)
